@@ -23,15 +23,35 @@ eQ3* cb_instance;
 
 #define SEMAPHORE_WAIT_TIME  (10000 / portTICK_PERIOD_MS)
 
+String LockStatusToString (LockStatus ls) {
+    switch(ls) {
+        case LockStatus::UNKNOWN:
+            return "UNKNOWN";
+        case LockStatus::MOVING:
+            return "MOVING";
+        case LockStatus::UNLOCKED:
+            return "UNLOCKED";
+        case LockStatus::LOCKED:
+            return "LOCKED";
+        case LockStatus::OPENED:
+            return "OPENED";
+        default:
+            return "UNKNOWN";
+    };    
+}
+
 // -----------------------------------------------------------------------------
-// --[notify_func]--------------------------------------------------------------
+// --[notify_func callback]--------------------------------------------------------------
 // -----------------------------------------------------------------------------
 void notify_func(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
     cb_instance->onNotify(pBLERemoteCharacteristic,pData,length,isNotify);
 }
 
-void scan_func(NimBLEScanResults pBleScanResults) {
-    Serial.println("# Got scan results!");
+// -----------------------------------------------------------------------------
+// --[status_func callback]-----------------------------------------------------
+// -----------------------------------------------------------------------------
+void status_func(LockStatus LockStatus) {
+    Serial.println("# Status changed: " + LockStatusToString(LockStatus));
 }
 
 // -----------------------------------------------------------------------------
@@ -43,21 +63,16 @@ eQ3::eQ3(std::string ble_address, std::string user_key, unsigned char user_id) {
     //Serial.println(state.user_key.length());
     state.user_id = user_id;
 
+    // init BLE scan
+    bleScan = NimBLEDevice::getScan();
+    // init BLE client
+    bleClient = NimBLEDevice::createClient(NimBLEAddress(address));
+
     cb_instance = this;
     mutex = xSemaphoreCreateMutex();
     this->address = ble_address;
 
-    // init BLE scan
-    bleScan = NimBLEDevice::getScan();
-    bleScan->setAdvertisedDeviceCallbacks(this);
-    bleScan->setActiveScan(true);
-    bleScan->setInterval(50);
-    bleScan->setWindow(50);
-    
-
-    // TODO move this out to an extra init?
-    bleClient = NimBLEDevice::createClient();
-    bleClient->setClientCallbacks((NimBLEClientCallbacks *)this);
+    setOnStatusChange(status_func);
 
     // pin to core 1 (where the Arduino main loop resides), priority 1
     xTaskCreatePinnedToCore(&tickTask, "worker", 10240, this, 1, nullptr, 1);
@@ -66,59 +81,107 @@ eQ3::eQ3(std::string ble_address, std::string user_key, unsigned char user_id) {
 // -----------------------------------------------------------------------------
 // --[onConnect]----------------------------------------------------------------
 // -----------------------------------------------------------------------------
+// NimBLEClientCallbacks virtual override
 void eQ3::onConnect(NimBLEClient *pClient) {
-    Serial.println("# Connecting...");
     state.connectionState = CONNECTING;
 }
 
 // -----------------------------------------------------------------------------
 // --[onDisconnect]-------------------------------------------------------------
 // -----------------------------------------------------------------------------
+// NimBLEClientCallbacks virtual override
 void eQ3::onDisconnect(NimBLEClient *pClient) {
-    Serial.println("# Disconnected!");
     state.connectionState = DISCONNECTED;
     recvFragments.clear();
-    sendQueue = std::queue<eQ3Message::MessageFragment>(); // clear queue
+    std::queue<eQ3Message::MessageFragment>().swap(sendQueue); // clear queue
     queue.clear();
-    sendChar = recvChar = nullptr;
+    delete sendCharacteristic;
+    delete recvCharacteristic;
+    // init BLE scan
+    bleClient = NimBLEDevice::createClient(NimBLEAddress(address));
 }
 
 // -----------------------------------------------------------------------------
 // --[onTick]-------------------------------------------------------------------
 // -----------------------------------------------------------------------------
 bool eQ3::onTick() {
-    // end task when disconnected?
-    //if (state.connectionState == DISCONNECTED)
-    //    return false;
     if (xSemaphoreTake(mutex, 0)) {
-        if (state.connectionState == FOUND) {
-            Serial.println("# Connecting in tick");
+        //Serial.println("# Taking semaphore in tick");
+        switch (state.connectionState)
+        {
+
+        case DISCONNECTED:
+            break;
+
+        case SCANNING:
+            // Handled by callback
+            break;
+
+        case FOUND:
+        {
+            Serial.println("# Connecting...");            
+            bleClient->setClientCallbacks((NimBLEClientCallbacks *)this);
             bleClient->connect(NimBLEAddress(address));
-        } else if (state.connectionState == CONNECTING) {
-            Serial.println("# Connected in tick");
+            break;
+        }
+        break;
+
+        case CONNECTING:
+        {
+            Serial.println("# Retrieving characteristics and establishing connection...");
             NimBLERemoteService *comm;
             comm = bleClient->getService(NimBLEUUID(BLE_UUID_SERVICE));
-            sendChar = comm->getCharacteristic(NimBLEUUID(BLE_UUID_WRITE)); // write buffer characteristic
-            recvChar = comm->getCharacteristic(NimBLEUUID(BLE_UUID_READ)); // read buffer characteristic
-            //recvChar->setNotifyCallbacks((NimBLERemoteCharacteristicCallbacks*)this);
-            recvChar->registerForNotify(&notify_func);
+            sendCharacteristic = comm->getCharacteristic(NimBLEUUID(BLE_UUID_WRITE)); // write buffer characteristic
+            recvCharacteristic = comm->getCharacteristic(NimBLEUUID(BLE_UUID_READ));  // read buffer characteristic
+            recvCharacteristic->subscribe(true, notify_func);
             lastActivity = time(NULL);
+            Serial.println("# Connected");
             state.connectionState = CONNECTED;
+        }
+        break;
+
+        case CONNECTED:
+        {
+            //Serial.println("# Executing CONNECTED queue in tick");
             auto queueFunc = queue.find(CONNECTED);
-            if (queueFunc != queue.end()) {
+            if (queueFunc != queue.end())
+            {
                 queue.erase(CONNECTED);
-                //xSemaphoreGive(mutex); // function will take the semaphore again
                 queueFunc->second();
             }
-        } else {
+        }
+        break;
+
+        case NONCES_EXCHANGING:
+        {
+            Serial.println("# Verifying remote session nonce...");
+            state.user_id = _ConnectionInfoMessage.getUserId();
+            state.remote_session_nonce = _ConnectionInfoMessage.getRemoteSessionNonce();
+            assert(state.remote_session_nonce.length() == 8);
+            state.local_security_counter = 1;
+            state.remote_security_counter = 0;
+            state.connectionState = NONCES_EXCHANGED;
+        }
+        break;
+        case NONCES_EXCHANGED:
+        {
+            //Serial.println("# Executing NONCES_EXCHANGED queue in tick");
+            auto queueFunc = queue.find(NONCES_EXCHANGED);
+            if (queueFunc != queue.end())
+            {
+                queue.erase(queueFunc);
+                queueFunc->second();
+            }
+        }
+        break;
+        default:
+            Serial.println("# Default tick");
+        }
+        if (state.connectionState > CONNECTING) {
             sendNextFragment();
             lastActivity = time(NULL);
         }
-        // TODO disconnect if no answer for long time?
-       /* if (state.connectionState >= CONNECTED && difftime(lastActivity, time(NULL)) > LOCK_TIMEOUT && sendQueue.empty()) {
-            Serial.println("# Lock timeout");
-            bleClient->disconnect();
-        }*/
+        //Serial.println("# Releasing semaphore in tick");
         xSemaphoreGive(mutex);
     }
     return true;
@@ -127,6 +190,7 @@ bool eQ3::onTick() {
 // -----------------------------------------------------------------------------
 // --[onResult]-----------------------------------------------------------------
 // -----------------------------------------------------------------------------
+// NimBLEAdvertisedDeviceCallbacks virtual override
 void eQ3::onResult(NimBLEAdvertisedDevice* advertisedDevice) {
     if (advertisedDevice->getAddress().toString() == address) { // TODO: Make name and address variable
         Serial.print("# Found device: ");
@@ -145,7 +209,9 @@ void eQ3::onResult(NimBLEAdvertisedDevice* advertisedDevice) {
 // -----------------------------------------------------------------------------
 void eQ3::setOnStatusChange(std::function<void(LockStatus)> cb) {
     xSemaphoreTake(mutex, SEMAPHORE_WAIT_TIME);
+    Serial.println("# Taking semaphore setOnStatusChange");
     onStatusChange = cb;
+    Serial.println("# Releasing semaphore setOnStatusChange");
     xSemaphoreGive(mutex);
 }
 
@@ -166,10 +232,12 @@ void eQ3::exchangeNonces() {
 // -----------------------------------------------------------------------------
 void eQ3::connect() {
     state.connectionState = SCANNING;
-    bleScan->start(25, &scan_func, false);
+    bleScan->setAdvertisedDeviceCallbacks(this);
+    bleScan->setActiveScan(true);
+    bleScan->setInterval(50);
+    bleScan->setWindow(50);
+    bleScan->start(25, false);
     Serial.println("# Searching ...");
-    //state.connectionState = FOUND;
-    //Serial.println("connecting directly...");
 }
 
 // -----------------------------------------------------------------------------
@@ -181,7 +249,6 @@ bool eQ3::sendMessage(eQ3Message::Message *msg) {
         if (state.connectionState < NONCES_EXCHANGED) {
             // TODO check if slot for nonces_exchanged is already set?
             queue.insert(make_pair(NONCES_EXCHANGED,[this,msg]{
-                Serial.println("# sendMessage called again...");
                 sendMessage(msg);
             }));
             exchangeNonces();
@@ -193,7 +260,7 @@ bool eQ3::sendMessage(eQ3Message::Message *msg) {
         int pad_to = generic_ceil(padded_data.length(), 15, 8);
         if (pad_to > padded_data.length())
             padded_data.append(pad_to - padded_data.length(), 0);
-        crypt_data(padded_data, msg->id, state.remote_session_nonce, state.local_security_counter, state.user_key);
+        //crypt_data(padded_data, msg->id, state.remote_session_nonce, state.local_security_counter, state.user_key);
         data.append(1, msg->id);
         data.append(crypt_data(padded_data, msg->id, state.remote_session_nonce, state.local_security_counter, state.user_key));
         data.append(1, (char) (state.local_security_counter >> 8));
@@ -234,6 +301,7 @@ bool eQ3::sendMessage(eQ3Message::Message *msg) {
 // -----------------------------------------------------------------------------
 void eQ3::onNotify(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
     xSemaphoreTake(mutex, SEMAPHORE_WAIT_TIME);
+    Serial.println("# Taking semaphore onNotify");
     eQ3Message::MessageFragment frag;
     lastActivity = time(NULL);
     frag.data = std::string((char *) pData, length);
@@ -261,7 +329,7 @@ void eQ3::onNotify(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t
                 Serial.println(msg_security_counter);
                 Serial.print("# Security counter: ");
                 Serial.println(state.remote_security_counter);
-                Serial.println("# Falscher remote counter");
+                Serial.println("# Counterfeit remote counter, releasing semaphore onNotify");
                 xSemaphoreGive(mutex);
                 return;
             }
@@ -275,12 +343,12 @@ void eQ3::onNotify(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t
             Serial.println(string_to_hex(msgdata.substr(1, msgdata.length() - 7)).c_str());
             std::string computed_auth_value = compute_auth_value(decrypted, msgtype, state.local_session_nonce, state.remote_security_counter, state.user_key);
             if (msg_auth_value != computed_auth_value) {
-                Serial.println("# Auth value mismatch");
+                Serial.println("# Auth value mismatch, releasing semaphore onNotify");
                 xSemaphoreGive(mutex);
                 return;
             }
             msgdata = decrypted;
-            Serial.print("# Decrypted: ");
+            Serial.print("# Decrypted data: ");
             Serial.println(string_to_hex(msgdata).c_str());
         }
 
@@ -289,6 +357,7 @@ void eQ3::onNotify(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t
                 // fragment ack, remove first
                 if (!sendQueue.empty())
                     sendQueue.pop();
+                Serial.println("# Ack message, releasing semaphore onNotify");
                 xSemaphoreGive(mutex);
                 return;
             }
@@ -314,41 +383,24 @@ void eQ3::onNotify(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t
 
             case 0x03: {
                 // connection info message
-                eQ3Message::Connection_Info_Message message;
-                message.data = msgdata;
-                state.user_id = message.getUserId();
-                state.remote_session_nonce = message.getRemoteSessionNonce();
-                assert(state.remote_session_nonce.length() == 8);
-                state.local_security_counter = 1;
-                state.remote_security_counter = 0;
-                state.connectionState = NONCES_EXCHANGED;
-
-                Serial.println("# Nonce exchanged");
-                auto queueFunc = queue.find(NONCES_EXCHANGED);
-                if (queueFunc != queue.end()) {
-                    queue.erase(queueFunc);
-                    //xSemaphoreGive(mutex); // function will take the semaphore again
-                    queueFunc->second();
-                }
-                xSemaphoreGive(mutex);
-                return;
+                _ConnectionInfoMessage.data = msgdata;
+                state.connectionState = NONCES_EXCHANGING;
+                break;
             }
 
             case 0x83: {
                 // status info
                 eQ3Message::Status_Info_Message message;
                 message.data = msgdata;
-                Serial.print("# New state: ");
-                Serial.println(message.getLockStatus());
                 _LockStatus = message.getLockStatus();
                 _BatteryStatus = message.getBatteryStatus();
-                //onStatusChange((LockStatus) _LockStatus); // BUG: löst einen Reset aus!!
+                onStatusChange((LockStatus) _LockStatus); // BUG: löst einen Reset aus!!
                 break;
             }
 
             default:
             /*case 0x8f: */{ // user info
-                Serial.println("# User info");
+                Serial.println("# User info, releasing semaphore onNotify");
                 xSemaphoreGive(mutex);
                 return;
             }
@@ -360,6 +412,7 @@ void eQ3::onNotify(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t
         eQ3Message::FragmentAckMessage ack(frag.getStatusByte());
         sendQueue.push(ack);
     }
+    Serial.println("# Releasing semaphore onNotify (end)");
     xSemaphoreGive(mutex);
 }
 
@@ -368,6 +421,7 @@ void eQ3::onNotify(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t
 // -----------------------------------------------------------------------------
 void eQ3::pairingRequest(std::string cardkey) {
     xSemaphoreTake(mutex, SEMAPHORE_WAIT_TIME);
+    Serial.println("# Taking semaphore pairingRequest");
     if (state.connectionState < NONCES_EXCHANGED) {
         // TODO check if slot for nonces_exchanged is already set?
 
@@ -377,6 +431,7 @@ void eQ3::pairingRequest(std::string cardkey) {
         }));
         Serial.println("# Pairing request");
         exchangeNonces();
+        Serial.println("# Releasing semaphore pairingRequest");
         xSemaphoreGive(mutex);
         return;
     }
@@ -413,32 +468,34 @@ void eQ3::pairingRequest(std::string cardkey) {
     message->data.append(auth_value);
     assert(message->data.length() == 29);
     sendMessage(message);
+    Serial.println("# Releasing semaphore pairingRequest");
     xSemaphoreGive(mutex);
 }
 
 // -----------------------------------------------------------------------------
 // --[sendNextFragment]---------------------------------------------------------
 // -----------------------------------------------------------------------------
+// Used on Tick
 void eQ3::sendNextFragment() {
     if (sendQueue.empty())
         return;
     if (sendQueue.front().sent && std::difftime(sendQueue.front().timeSent, std::time(NULL)) < 5)
         return;
     sendQueue.front().sent = true;
-    Serial.print("# Sending actual fragment: ");
     string data = sendQueue.front().data;
     sendQueue.front().timeSent = std::time(NULL);
+    Serial.print("# Sending fragment: ");
     Serial.println(string_to_hex(data).c_str());
     assert(data.length() == 16);
-    sendChar->writeValue((uint8_t *) (data.c_str()), 16, true);
+    sendCharacteristic->writeValue((uint8_t *) (data.c_str()), 16, true);
 }
 
 void eQ3::sendCommand(CommandType command) {
     xSemaphoreTake(mutex, SEMAPHORE_WAIT_TIME);
-    Serial.println("# Getting Semaphore for sendcommand");
+    Serial.println("# Taking semaphore sendCommand");
     auto msg = new eQ3Message::CommandMessage(command);
     sendMessage(msg);
-    Serial.println("# Semaphore handover");
+    Serial.println("# Releasing semaphore sendCommand");
     xSemaphoreGive(mutex);
 }
 
@@ -456,7 +513,9 @@ void eQ3::open() {
 
 void eQ3::updateInfo() {
     xSemaphoreTake(mutex, SEMAPHORE_WAIT_TIME);
+    Serial.println("# Taking semaphore updateInfo");
     auto * message = new eQ3Message::StatusRequestMessage;
     sendMessage(message);
+    Serial.println("# Releasing semaphore updateInfo");
     xSemaphoreGive(mutex);
 }

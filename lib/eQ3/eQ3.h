@@ -18,7 +18,8 @@ typedef std::function<void(void*, eQ3*)> KeyBleStatusHandler;
 
 void tickTask(void *params);
 void notify_func(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify);
-void scan_func(NimBLEScanResults pBLEScanResults);
+void status_func(LockStatus _LockStatus);
+
 class eQ3 : public NimBLEAdvertisedDeviceCallbacks, public NimBLEClientCallbacks {
     friend void tickTask(void *params);
     std::map<ConnectionState,std::function<void(void)>> queue;
@@ -42,9 +43,9 @@ class eQ3 : public NimBLEAdvertisedDeviceCallbacks, public NimBLEClientCallbacks
 
     NimBLEScan *bleScan;
     
-    NimBLERemoteCharacteristic *sendChar;
-    NimBLERemoteCharacteristic *recvChar;
-    NimBLEAdvertisedDevice *device;
+    NimBLERemoteCharacteristic *sendCharacteristic;
+    NimBLERemoteCharacteristic *recvCharacteristic;
+    //NimBLEAdvertisedDevice *advertisedDevice;
 
     time_t lastActivity = 0;
 
@@ -56,6 +57,7 @@ public:
     int _LockStatus;
     int _BatteryStatus;
     int _RSSI;
+    eQ3Message::Connection_Info_Message _ConnectionInfoMessage;
     bool onTick();
     void lock();
     void unlock();

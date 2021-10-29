@@ -13,7 +13,8 @@ typedef enum {
     FOUND = 2,
     CONNECTING = 3,
     CONNECTED = 4,
-    NONCES_EXCHANGED = 5
+    NONCES_EXCHANGING = 5,
+    NONCES_EXCHANGED = 6
 } ConnectionState;
 
 typedef struct {
