@@ -41,4 +41,9 @@ typedef enum {
     OPENED = 4
 } LockStatus;
 
+typedef enum {
+    NORMAL = false,
+    LOWBATT = true
+} BatteryStatus;
+
 #endif //DOOR_OPENER_CONST_H

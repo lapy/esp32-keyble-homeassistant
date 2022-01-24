@@ -16,9 +16,10 @@ class eQ3;
 
 typedef std::function<void(void*, eQ3*)> KeyBleStatusHandler;
 
+String LockStatusToString (LockStatus ls);
 void tickTask(void *params);
 void notify_func(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify);
-void status_func(LockStatus _LockStatus);
+void status_func(LockStatus _LockStatus, BatteryStatus _BatteryStatus, int _RSSI);
 
 class eQ3 : public NimBLEAdvertisedDeviceCallbacks, public NimBLEClientCallbacks {
     friend void tickTask(void *params);
@@ -27,6 +28,7 @@ class eQ3 : public NimBLEAdvertisedDeviceCallbacks, public NimBLEClientCallbacks
     void onConnect(NimBLEClient *pClient);
     void connectHandler();
     void onDisconnect(NimBLEClient *pClient);
+    bool onConnParamsUpdateRequest(NimBLEClient* pClient, const ble_gap_upd_params* params);
     void onResult(NimBLEAdvertisedDevice* advertisedDevice);
     void sendNextFragment();
     void exchangeNonces();
@@ -50,12 +52,12 @@ class eQ3 : public NimBLEAdvertisedDeviceCallbacks, public NimBLEClientCallbacks
     time_t lastActivity = 0;
 
     SemaphoreHandle_t mutex;
-    std::function<void(LockStatus)> onStatusChange;
+    std::function<void(LockStatus, BatteryStatus, int)> onStatusChange;
 public:
     ClientState state;
     NimBLEClient *bleClient;
-    int _LockStatus;
-    int _BatteryStatus;
+    LockStatus _LockStatus;
+    BatteryStatus _BatteryStatus;
     int _RSSI;
     eQ3Message::Connection_Info_Message _ConnectionInfoMessage;
     bool onTick();
@@ -66,7 +68,7 @@ public:
     void connect();
     void updateInfo();
     void toggle();
-    void setOnStatusChange(std::function<void(LockStatus)> cb);
+    void setOnStatusChange(std::function<void(LockStatus, BatteryStatus, int)> cb);
     void onNotify(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify);
     eQ3(std::string ble_address, std::string user_key, unsigned char user_id = 0xFF);
 };

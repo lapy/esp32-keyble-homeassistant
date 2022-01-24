@@ -4,17 +4,29 @@
 #include <queue>
 #include <string>
 #include "eQ3.h"
-#include <WiFi.h>
 #include <PubSubClient.h>
-#include <esp_wifi.h>
 #include <NimBLEDevice.h>
+#include <WiFiClient.h>
 
-#define WIFI_SSID "###"
-#define WIFI_PASSWORD "###"
-#define MQTT_HOST "###"
+#define ETH_CLK_MODE ETH_CLOCK_GPIO17_OUT
+#define ETH_PHY_POWER 12
+
+#include <ETH.h>
+
+// -----------------------------------------------------------------------------
+// CONFIGURATION
+// -----------------------------------------------------------------------------
+// MQTT configuration
+#define MQTT_HOST ""
 #define MQTT_PORT 1883
-#define MQTT_USER "###"
-#define MQTT_PASSWORD "###"
+#define MQTT_USER ""
+#define MQTT_PASSWORD ""
+// Keyble credentials
+#define ADDRESS ""
+#define USER_KEY ""
+#define USER_ID 1
+#define CARD_KEY ""
+// Other settings - change only if you know what you are doing
 #define MQTT_ROOT_TOPIC "smartlock"
 #define MQTT_SUB_COMMAND "/KeyBLE/set"
 #define MQTT_SUB_STATE "/KeyBLE/get"
@@ -23,19 +35,13 @@
 #define MQTT_PUB_AVAILABILITY "/KeyBLE/availability"
 #define MQTT_PUB_BATT "/KeyBLE/battery"
 #define MQTT_PUB_RSSI "/KeyBLE/linkquality"
-#define ADDRESS "###"
-#define USER_KEY "###"
-#define USER_ID 2
-#define CARD_KEY "###"
 #define HOMEASSISTANT_MQTT_PREFIX "homeassistant"
-#define REFRESH_INTERVAL 30000
+#define REFRESH_INTERVAL 60000
 #define CONFIG_BT_NIMBLE_PINNED_TO_CORE 0
-
-// NETWORK PARAMETERS
-IPAddress ip(0, 0, 0, 0); // Set fixed ip
-IPAddress gateway(0, 0, 0, 0); // Gateway/router ip
-IPAddress subnet(255, 255, 255, 0); // Subnet mask
-IPAddress dns(0, 0, 0, 0); // Dns server
+#define PUBLISH_RETRIES 10
+// -----------------------------------------------------------------------------
+// END CONFIGURATION
+// -----------------------------------------------------------------------------
 
 eQ3 *keyble;
 bool do_toggle = false;
@@ -47,12 +53,10 @@ bool do_pair = false;
 bool wifiActive = true;
 bool cmdTriggered = false;
 unsigned long timeout = 0;
-bool statusUpdated = false;
 bool waitForAnswer = false;
 unsigned long starttime = 0;
-int status = 0;
-bool batteryLow = false;
-String keybleRssi = "";
+LockStatus status;
+BatteryStatus batteryLow;
 unsigned long previousMillis = 0;
 unsigned long currentMillis = 0;
 
@@ -70,32 +74,109 @@ const char *mqtt_pub_lock_topic = MQTT_ROOT_TOPIC MQTT_PUB_LOCK_STATE;
 const char *mqtt_pub_availability_topic = MQTT_ROOT_TOPIC MQTT_PUB_AVAILABILITY;
 const char *mqtt_pub_battery_topic = MQTT_ROOT_TOPIC MQTT_PUB_BATT;
 const char *mqtt_pub_rssi_topic = MQTT_ROOT_TOPIC MQTT_PUB_RSSI;
+char charBufferStatus[10];
+char charBufferLockStatus[9];
+char charBufferAvailability[8];
+char charBufferBatt[6];
+char charBufferRssi[4];
+bool statusChanged = false;
 
 void MqttCallback(char *topic, byte *payload, unsigned int length);
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(MQTT_HOST, MQTT_PORT, &MqttCallback, wifiClient);
 
-// -----------------------------------------------------------------------------
-// ---[SetWifi]-----------------------------------------------------------------
-// -----------------------------------------------------------------------------
-void SetWifi(bool active)
-{
-  wifiActive = active;
+static bool eth_connected = false;
+uint64_t chipid;
 
-  if (active)
-  {
-    WiFi.mode(WIFI_STA);
-    Serial.println("# WiFi enabled");
+// -----------------------------------------------------------------------------
+// ---[HomeAssistant-Setup]-----------------------------------------------------
+// -----------------------------------------------------------------------------
+void SetupHomeAssistant()
+{
+  // Temporarily increase buffer size to send bigger payloads
+  mqttClient.setBufferSize(500);
+
+  Serial.println("# Setting up Home Assistant autodiscovery");
+
+  String lock_conf = String() + "{\"~\":\"" + MQTT_ROOT_TOPIC + "\"," +
+                     +"\"name\":\"Eqiva Bluetooth Smart Lock\"," +
+                     +"\"device\":{\"identifiers\":[\"keyble_" + ADDRESS + "\"]," +
+                     +"\"manufacturer\":\"eQ-3\",\"model\":\"Key-BLE\",\"name\":\"Eqiva Bluetooth Smart Lock\" }," +
+                     +"\"uniq_id\":\"keyble_" + ADDRESS + "\"," +
+                     +"\"stat_t\":\"~" + MQTT_PUB_STATE + "\"," +
+                     +"\"avty_t\":\"~" + MQTT_PUB_AVAILABILITY + "\"," +
+                     +"\"opt\":false," + // optimistic false, wait for actual state update
+                     +"\"cmd_t\":\"~" + MQTT_SUB_COMMAND + "\"}";
+
+  Serial.println("# " + String(HOMEASSISTANT_MQTT_PREFIX) + "/lock/KeyBLE/config");
+  mqttClient.publish((String(HOMEASSISTANT_MQTT_PREFIX) + "/lock/KeyBLE/config").c_str(), lock_conf.c_str(), true);
+
+  String lock_state_conf = String() + "{\"~\":\"" + MQTT_ROOT_TOPIC + "\"," +
+                           +"\"name\":\"Eqiva Bluetooth Smart Lock Lockstate\"," +
+                           +"\"device\":{\"identifiers\":[\"keyble_" + ADDRESS + "\"]," +
+                           +"\"manufacturer\":\"eQ-3\",\"model\":\"Key-BLE\",\"name\":\"Eqiva Bluetooth Smart Lock\"}," +
+                           +"\"uniq_id\":\"keyble_" + ADDRESS + "_lockstate\"," +
+                           +"\"stat_t\":\"~" + MQTT_PUB_LOCK_STATE + "\"," +
+                           +"\"avty_t\":\"~" + MQTT_PUB_AVAILABILITY + "\"," +
+                           +"\"icon\":\"mdi:lock-alert-outline\"}";
+
+  Serial.println("# " + String(HOMEASSISTANT_MQTT_PREFIX) + "/sensor/KeyBLE/lockstate/config");
+  mqttClient.publish((String(HOMEASSISTANT_MQTT_PREFIX) + "/sensor/KeyBLE/lockstate/config").c_str(), lock_state_conf.c_str(), true);
+
+  String link_quality_conf = String() + "{\"~\":\"" + MQTT_ROOT_TOPIC + "\"," +
+                             +"\"name\":\"Eqiva Bluetooth Smart Lock Linkquality\"," +
+                             +"\"device\":{\"identifiers\":[\"keyble_" + ADDRESS + "\"]," +
+                             +"\"manufacturer\":\"eQ-3\",\"model\":\"Key-BLE\",\"name\":\"Eqiva Bluetooth Smart Lock\"}," +
+                             +"\"uniq_id\":\"keyble_" + ADDRESS + "_linkquality\"," +
+                             +"\"stat_t\":\"~" + MQTT_PUB_RSSI + "\"," +
+                             +"\"avty_t\":\"~" + MQTT_PUB_AVAILABILITY + "\"," +
+                             +"\"dev_cla\":\"signal_strength\"}";
+
+  Serial.println("# " + String(HOMEASSISTANT_MQTT_PREFIX) + "/sensor/KeyBLE/linkquality/config");
+  mqttClient.publish((String(HOMEASSISTANT_MQTT_PREFIX) + "/sensor/KeyBLE/linkquality/config").c_str(), link_quality_conf.c_str(), true);
+
+  String battery_conf = String() + "{\"~\": \"" + MQTT_ROOT_TOPIC + "\"," +
+                        +"\"name\":\"Eqiva Bluetooth Smart Lock Battery\"," +
+                        +"\"device\":{\"identifiers\":[\"keyble_" + ADDRESS + "\"]," +
+                        +"\"manufacturer\":\"eQ-3\",\"model\":\"Key-BLE\", \"name\":\"Eqiva Bluetooth Smart Lock\" }," +
+                        +"\"uniq_id\":\"keyble_" + ADDRESS + "_battery\"," +
+                        +"\"stat_t\":\"~" + MQTT_PUB_BATT + "\"," +
+                        +"\"avty_t\":\"~" + MQTT_PUB_AVAILABILITY + "\"," +
+                        +"\"dev_cla\":\"battery\"}";
+
+  Serial.println("# " + String(HOMEASSISTANT_MQTT_PREFIX) + "/binary_sensor/KeyBLE/battery/config");
+  mqttClient.publish((String(HOMEASSISTANT_MQTT_PREFIX) + "/binary_sensor/KeyBLE/battery/config").c_str(), battery_conf.c_str(), true);
+
+  // Reset buffer size to default
+  mqttClient.setBufferSize(256);
+
+  Serial.println("# Home Assistant autodiscovery configured");
+}
+
+// -----------------------------------------------------------------------------
+// ---[MQTT-Setup]--------------------------------------------------------------
+// -----------------------------------------------------------------------------
+void SetupMqtt()
+{
+  Serial.println("# Setting up MQTT");
+  while (!mqttClient.connected())
+  { // Loop until we're reconnected to the MQTT server
+    mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+    mqttClient.setCallback(&MqttCallback);
+    //Serial.println("# Connect to MQTT-Broker... ");
+    if (mqttClient.connect(MQTT_ROOT_TOPIC, MQTT_USER, MQTT_PASSWORD))
+    {
+      Serial.println("# MQTT connected!");
+      mqttClient.subscribe(mqtt_sub_command_topic);
+      Serial.print("# Subscribed to topic: ");
+      Serial.println(mqtt_sub_command_topic);
+      mqttClient.subscribe(mqtt_sub_state_topic);
+      Serial.print("# Subscribed to topic: ");
+      Serial.println(mqtt_sub_state_topic);
+      Serial.println("# MQTT Setup done");
+    }
   }
-  else
-  {
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-    Serial.println("# WiFi disabled");
-  }
-  // delay(100);
-  // yield();
 }
 
 // -----------------------------------------------------------------------------
@@ -156,119 +237,80 @@ void MqttCallback(char *topic, byte *payload, unsigned int length)
 }
 
 // -----------------------------------------------------------------------------
-// ---[Wifi signal quality]-----------------------------------------------------
+// ---[StatusUpdateCallback]----------------------------------------------------
 // -----------------------------------------------------------------------------
-int GetWifiSignalQuality()
+void StatusUpdateCallback(LockStatus newlockstatus, BatteryStatus newbatterystatus, int RSSI)
 {
-  float signal = 2 * (WiFi.RSSI() + 100);
-  if (signal > 100)
-    return 100;
-  else
-    return signal;
+  Serial.println("# Status changed: " + LockStatusToString(newlockstatus));
+
+  //MQTT_PUB_STATE status
+  status = newlockstatus;
+  batteryLow = newbatterystatus;
+  String str_status = "";
+  if (status == LockStatus::UNLOCKED || status == LockStatus::OPENED)
+    str_status = "UNLOCKED";
+  else if (status == LockStatus::LOCKED)
+    str_status = "LOCKED";
+  str_status.toCharArray(charBufferStatus, 10);
+
+  //MQTT_PUB_LOCK_STATE lock status (more detailed)
+  String strBufferLockStatus = LockStatusToString(newlockstatus);
+  strBufferLockStatus.toCharArray(charBufferLockStatus, 9);
+
+  //MQTT_PUB_AVAILABILITY availability
+  String str_availability = (status > LockStatus::UNKNOWN) ? "online" : "offline";
+  str_availability.toCharArray(charBufferAvailability, 8);
+
+  //MQTT_PUB_BATT battery
+  String str_batt = newbatterystatus ? "true" : "false";
+  str_batt.toCharArray(charBufferBatt, 6);
+
+  //MQTT_PUB_RSSI rssi
+  String keybleRssi = String(RSSI);
+  keybleRssi.toCharArray(charBufferRssi, 4);
+
+  statusChanged = true;
 }
 
 // -----------------------------------------------------------------------------
-// ---[Start WiFi]--------------------------------------------------------------
+// ---[WiFiEventHandler]---------------------------------------------------------------
 // -----------------------------------------------------------------------------
-void SetupWifi()
+void WiFiEventHandler(WiFiEvent_t event)
 {
-  Serial.println("# WIFI: configuring...");
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.config(ip, dns, gateway, subnet);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  if (WiFi.status() == WL_CONNECTED)
-    Serial.println("# WIFI: connection restored to SSiD: " + WiFi.SSID());
-
-  int maxWait = 5000000;
-  while (WiFi.status() != WL_CONNECTED)
+  switch (event)
   {
-    //Serial.println("# WIFI: check SSiD: " + String(WIFI_SSID));
-    //WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    delay(1);
-
-    if (maxWait <= 0)
-      ESP.restart();
-    maxWait--;
-  }
-  Serial.println("# WIFI: connected!");
-  Serial.println("# WIFI: signal quality: " + String(GetWifiSignalQuality()) + "%");
-  Serial.print("# WIFI: IP Address: ");
-  Serial.println(WiFi.localIP());
-}
-// ---[HomeAssistant-Setup]--------------------------------------------------------------
-void SetupHomeAssistant()
-{
-  // Temporarily increase buffer size to send bigger payloads
-  mqttClient.setBufferSize(500);
-
-  Serial.println("# Setting up Home Assistant autodiscovery");
-
-  String lock_conf = String() + "{\"~\":\"" + MQTT_ROOT_TOPIC + "\"," +
-                     +"\"name\":\"Eqiva Bluetooth Smart Lock\"," +
-                     +"\"device\":{\"identifiers\":[\"keyble_" + ADDRESS + "\"]," +
-                     +"\"manufacturer\":\"eQ-3\",\"model\":\"Key-BLE\",\"name\":\"Eqiva Bluetooth Smart Lock\" }," +
-                     +"\"uniq_id\":\"keyble_" + ADDRESS + "\"," +
-                     +"\"stat_t\":\"~" + MQTT_PUB_STATE + "\"," +
-                     +"\"avty_t\":\"~" + MQTT_PUB_AVAILABILITY + "\"," +
-                     +"\"opt\":false," + // optimistic false, wait for actual state update
-                     +"\"cmd_t\":\"~" + MQTT_SUB_COMMAND + "\"}";
-
-  Serial.println("# " + String(HOMEASSISTANT_MQTT_PREFIX) + "/lock/KeyBLE/config");
-  mqttClient.publish((String(HOMEASSISTANT_MQTT_PREFIX) + "/lock/KeyBLE/config").c_str(), lock_conf.c_str(), true);
-
-  String link_quality_conf = String() + "{\"~\":\"" + MQTT_ROOT_TOPIC + "\"," +
-                             +"\"name\":\"Eqiva Bluetooth Smart Lock Linkquality\"," +
-                             +"\"device\":{\"identifiers\":[\"keyble_" + ADDRESS + "\"]," +
-                             +"\"manufacturer\":\"eQ-3\",\"model\":\"Key-BLE\",\"name\":\"Eqiva Bluetooth Smart Lock\"}," +
-                             +"\"uniq_id\":\"keyble_" + ADDRESS + "_linkquality\"," +
-                             +"\"stat_t\":\"~" + MQTT_PUB_RSSI + "\"," +
-                             +"\"avty_t\":\"~" + MQTT_PUB_AVAILABILITY + "\"," +
-                             +"\"icon\":\"mdi:signal\"," +
-                             +"\"unit_of_meas\":\"rssi\"}";
-
-  Serial.println("# " + String(HOMEASSISTANT_MQTT_PREFIX) + "/sensor/KeyBLE/linkquality/config");
-  mqttClient.publish((String(HOMEASSISTANT_MQTT_PREFIX) + "/sensor/KeyBLE/linkquality/config").c_str(), link_quality_conf.c_str(), true);
-
-  String battery_conf = String() + "{\"~\": \"" + MQTT_ROOT_TOPIC + "\"," +
-                        +"\"name\":\"Eqiva Bluetooth Smart Lock Battery\"," +
-                        +"\"device\":{\"identifiers\":[\"keyble_" + ADDRESS + "\"]," +
-                        +"\"manufacturer\":\"eQ-3\",\"model\":\"Key-BLE\", \"name\":\"Eqiva Bluetooth Smart Lock\" }," +
-                        +"\"uniq_id\":\"keyble_" + ADDRESS + "_battery\"," +
-                        +"\"stat_t\":\"~" + MQTT_PUB_BATT + "\"," +
-                        +"\"avty_t\":\"~" + MQTT_PUB_AVAILABILITY + "\"," +
-                        +"\"dev_cla\":\"battery\"}";
-
-  Serial.println("# " + String(HOMEASSISTANT_MQTT_PREFIX) + "/binary_sensor/KeyBLE/battery/config");
-  mqttClient.publish((String(HOMEASSISTANT_MQTT_PREFIX) + "/binary_sensor/KeyBLE/battery/config").c_str(), battery_conf.c_str(), true);
-
-  // Reset buffer size to default
-  mqttClient.setBufferSize(256);
-
-  Serial.println("# Home Assistant autodiscovery configured");
-}
-// -----------------------------------------------------------------------------
-// ---[MQTT-Setup]--------------------------------------------------------------
-// -----------------------------------------------------------------------------
-void SetupMqtt()
-{
-  Serial.println("# Setting up MQTT");
-  while (!mqttClient.connected())
-  { // Loop until we're reconnected to the MQTT server
-    mqttClient.setServer(MQTT_HOST, MQTT_PORT);
-    mqttClient.setCallback(&MqttCallback);
-    //Serial.println("# Connect to MQTT-Broker... ");
-    if (mqttClient.connect(MQTT_ROOT_TOPIC, MQTT_USER, MQTT_PASSWORD))
+  case SYSTEM_EVENT_ETH_START:
+    Serial.println("# ETH Started");
+    //set eth hostname here
+    ETH.setHostname("esp32-ethernet");
+    break;
+  case SYSTEM_EVENT_ETH_CONNECTED:
+    Serial.println("# ETH Connected");
+    break;
+  case SYSTEM_EVENT_ETH_GOT_IP:
+    Serial.print("# ETH MAC: ");
+    Serial.print(ETH.macAddress());
+    Serial.print(", IPv4: ");
+    Serial.print(ETH.localIP());
+    if (ETH.fullDuplex())
     {
-      Serial.println("# MQTT connected!");
-      mqttClient.subscribe(mqtt_sub_command_topic);
-      Serial.print("# Subscribed to topic: ");
-      Serial.println(mqtt_sub_command_topic);
-      mqttClient.subscribe(mqtt_sub_state_topic);
-      Serial.print("# Subscribed to topic: ");
-      Serial.println(mqtt_sub_state_topic);
-      Serial.println("# MQTT Setup done");
+      Serial.print(", FULL_DUPLEX");
     }
+    Serial.print(", ");
+    Serial.print(ETH.linkSpeed());
+    Serial.println("Mbps");
+    eth_connected = true;
+    break;
+  case SYSTEM_EVENT_ETH_DISCONNECTED:
+    Serial.println("# ETH Disconnected");
+    eth_connected = false;
+    break;
+  case SYSTEM_EVENT_ETH_STOP:
+    Serial.println("# ETH Stopped");
+    eth_connected = false;
+    break;
+  default:
+    break;
   }
 }
 
@@ -279,18 +321,16 @@ void setup()
 {
   Serial.begin(115200);
   Serial.println("Start...");
-  //Serial.setDebugOutput(true);
-
-  SetupWifi();
-
+  //Ethernet
+  chipid = ESP.getEfuseMac();                                      //The chip ID is essentially its MAC address(length: 6 bytes).
+  Serial.printf("ESP32 Chip ID = %04X", (uint16_t)(chipid >> 32)); //print High 2 bytes
+  Serial.printf("%08X\n", (uint32_t)chipid);                       //print Low 4bytes.
+  WiFi.onEvent(WiFiEventHandler);
+  ETH.begin();
   //Bluetooth
   NimBLEDevice::init("esp32ble");
   keyble = new eQ3(ADDRESS, USER_KEY, USER_ID);
-
-  //MQTT
-  SetupMqtt();
-  SetupHomeAssistant();
-  //delay(500);
+  keyble->setOnStatusChange(StatusUpdateCallback);
   do_status = true;
 }
 
@@ -299,124 +339,60 @@ void setup()
 // -----------------------------------------------------------------------------
 void loop()
 {
-  // Wifi reconnect
-  if (wifiActive)
+  if (mqttClient.connected())
   {
-    if (WiFi.status() != WL_CONNECTED)
+    mqttClient.loop();
+    if (statusChanged)
     {
-      Serial.println("# WiFi disconnected, reconnect...");
-      SetupWifi();
-    }
-    else
-    {
-      // MQTT connected?
-      if (!mqttClient.connected())
-      {
-        if (WiFi.status() == WL_CONNECTED)
-        {
-          Serial.println("# MQTT disconnected, reconnect...");
-          SetupMqtt();
-        }
-      }
-      else if (mqttClient.connected())
-        mqttClient.loop();
-    }
-
-    if (statusUpdated && mqttClient.connected())
-    {
-      // delay(100);
-      //MQTT_PUB_STATE status
-      batteryLow = (keyble->_BatteryStatus);
-      status = keyble->_LockStatus;
-      String str_status = "unknown";
-      char charBufferStatus[10];
-
-      if (status == LockStatus::UNLOCKED || status == LockStatus::OPENED)
-        str_status = "UNLOCKED";
-      else if (status == LockStatus::LOCKED)
-        str_status = "LOCKED";
-
-      String strBuffer = str_status;
-      strBuffer.toCharArray(charBufferStatus, 10);
       mqttClient.publish(mqtt_pub_state_topic, charBufferStatus, false);
       Serial.print("# published ");
       Serial.print(mqtt_pub_state_topic);
       Serial.print("/");
       Serial.println(charBufferStatus);
       mqtt_pub_state_value = charBufferStatus;
-      // delay(100);
 
-      //MQTT_PUB_LOCK_STATE lock status
-      String str_lock_status = "";
-      char charBufferLockStatus[9];
-
-      if (status == LockStatus::MOVING)
-        str_lock_status = "moving";
-      else if (status == LockStatus::UNLOCKED)
-        str_lock_status = "unlocked";
-      else if (status == LockStatus::LOCKED)
-        str_lock_status = "locked";
-      else if (status == LockStatus::OPENED)
-        str_lock_status = "opened";
-      else if (status == LockStatus::UNKNOWN)
-        str_lock_status = "unknown";
-
-      String strBufferLockStatus = String(str_status);
-      strBufferLockStatus.toCharArray(charBufferLockStatus, 9);
       mqttClient.publish(mqtt_pub_lock_topic, charBufferLockStatus, false);
       Serial.print("# published ");
       Serial.print(mqtt_pub_lock_topic);
       Serial.print("/");
       Serial.println(charBufferLockStatus);
       mqtt_pub_lock_state_value = charBufferLockStatus;
-      // delay(100);
 
-      //MQTT_PUB_AVAILABILITY availability
-      String str_availability = (status > LockStatus::UNKNOWN) ? "online" : "offline";
-      char charBufferAvailability[8];
-      str_availability.toCharArray(charBufferAvailability, 8);
       mqttClient.publish(mqtt_pub_availability_topic, charBufferAvailability, false);
       Serial.print("# published ");
       Serial.print(mqtt_pub_availability_topic);
       Serial.print("/");
       Serial.println(charBufferAvailability);
       mqtt_pub_availability_value = charBufferAvailability;
-      // delay(100);
 
-      //MQTT_PUB_BATT battery
-      String str_batt = batteryLow ? "true" : "false";
-      char charBufferBatt[6];
-      str_batt.toCharArray(charBufferBatt, 6);
       mqttClient.publish(mqtt_pub_battery_topic, charBufferBatt, false);
       Serial.print("# published ");
       Serial.print(mqtt_pub_battery_topic);
       Serial.print("/");
       Serial.println(charBufferBatt);
       mqtt_pub_battery_value = charBufferBatt;
-      // delay(100);
 
-      //MQTT_PUB_RSSI rssi
-      keybleRssi = keyble->_RSSI;
-      char charBufferRssi[4];
-      keybleRssi.toCharArray(charBufferRssi, 4);
       mqttClient.publish(mqtt_pub_rssi_topic, charBufferRssi, false);
       Serial.print("# published ");
       Serial.print(mqtt_pub_rssi_topic);
       Serial.print("/");
       Serial.println(charBufferRssi);
       mqtt_pub_rssi_value = charBufferRssi;
-      // delay(100);
 
-      statusUpdated = false;
+      statusChanged = false;
     }
   }
+  else if (eth_connected) {
+    //MQTT
+    SetupMqtt();
+    //Homeassistant
+    SetupHomeAssistant();
+  }
+
   if (do_open || do_lock || do_unlock || do_status || do_toggle || do_pair)
   {
-    // delay(200);
-    SetWifi(false);
-    // yield();
     waitForAnswer = true;
-    keyble->_LockStatus = -1;
+    keyble->_LockStatus = LockStatus::UNKNOWN;
     starttime = millis();
 
     if (do_open)
@@ -498,11 +474,7 @@ void loop()
 
     if (finished)
     {
-      keyble->bleClient->disconnect();
-      while (keyble->state.connectionState != DISCONNECTED && !timeout)
-      {
-        delay(500);
-      }
+      Serial.println("# Lock operation terminated!");
     }
     else if (timeout)
     {
@@ -511,11 +483,6 @@ void loop()
 
     if (finished || timeout)
     {
-      // delay(200);
-      // yield();
-      SetWifi(true);
-
-      statusUpdated = true;
       waitForAnswer = false;
 
       if (REFRESH_INTERVAL)
@@ -536,5 +503,4 @@ void loop()
       previousMillis = currentMillis; //reset refresh counter
     }
   }
-  //keyble->onTick();
 }

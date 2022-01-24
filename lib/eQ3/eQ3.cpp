@@ -10,13 +10,15 @@ using namespace std;
 int _LockStatus = 0;
 int _RSSI = 0;
 
+
 // -----------------------------------------------------------------------------
 // --[tickTask]-----------------------------------------------------------------
 // -----------------------------------------------------------------------------
 void tickTask(void *params) {
     auto * inst = (eQ3*) params;
-    while(inst->onTick())
+    while(inst->onTick()) {
         yield();
+    }
 }
 
 eQ3* cb_instance;
@@ -50,8 +52,8 @@ void notify_func(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* 
 // -----------------------------------------------------------------------------
 // --[status_func callback]-----------------------------------------------------
 // -----------------------------------------------------------------------------
-void status_func(LockStatus LockStatus) {
-    Serial.println("# Status changed: " + LockStatusToString(LockStatus));
+void status_func(LockStatus _LockStatus, BatteryStatus _BatteryStatus, int _RSSI) {
+    Serial.println("# Status changed: " + LockStatusToString(_LockStatus));
 }
 
 // -----------------------------------------------------------------------------
@@ -66,7 +68,9 @@ eQ3::eQ3(std::string ble_address, std::string user_key, unsigned char user_id) {
     // init BLE scan
     bleScan = NimBLEDevice::getScan();
     // init BLE client
-    bleClient = NimBLEDevice::createClient(NimBLEAddress(address));
+    bleClient = NimBLEDevice::createClient();
+    bleClient->setClientCallbacks((NimBLEClientCallbacks *)this);
+
 
     cb_instance = this;
     mutex = xSemaphoreCreateMutex();
@@ -91,14 +95,19 @@ void eQ3::onConnect(NimBLEClient *pClient) {
 // -----------------------------------------------------------------------------
 // NimBLEClientCallbacks virtual override
 void eQ3::onDisconnect(NimBLEClient *pClient) {
+    Serial.println("# Disconnected...");
     state.connectionState = DISCONNECTED;
     recvFragments.clear();
     std::queue<eQ3Message::MessageFragment>().swap(sendQueue); // clear queue
     queue.clear();
-    delete sendCharacteristic;
-    delete recvCharacteristic;
-    // init BLE scan
-    bleClient = NimBLEDevice::createClient(NimBLEAddress(address));
+    sendCharacteristic->deleteDescriptors();
+    recvCharacteristic->deleteDescriptors();
+}
+
+// NimBLEClientCallbacks virtual override
+bool eQ3::onConnParamsUpdateRequest(NimBLEClient* pClient, const ble_gap_upd_params* params) {
+    Serial.println("# onConnParamsUpdateRequest!!!");
+    pClient->setConnectionParams(params->itvl_min, params->itvl_max, params->latency, params->supervision_timeout);
 }
 
 // -----------------------------------------------------------------------------
@@ -119,8 +128,7 @@ bool eQ3::onTick() {
 
         case FOUND:
         {
-            Serial.println("# Connecting...");            
-            bleClient->setClientCallbacks((NimBLEClientCallbacks *)this);
+            Serial.println("# Found, connecting...");
             bleClient->connect(NimBLEAddress(address));
             break;
         }
@@ -207,11 +215,9 @@ void eQ3::onResult(NimBLEAdvertisedDevice* advertisedDevice) {
 // -----------------------------------------------------------------------------
 // --[setOnStatusChange]--------------------------------------------------------
 // -----------------------------------------------------------------------------
-void eQ3::setOnStatusChange(std::function<void(LockStatus)> cb) {
+void eQ3::setOnStatusChange(std::function<void(LockStatus, BatteryStatus, int)> cb) {
     xSemaphoreTake(mutex, SEMAPHORE_WAIT_TIME);
-    Serial.println("# Taking semaphore setOnStatusChange");
     onStatusChange = cb;
-    Serial.println("# Releasing semaphore setOnStatusChange");
     xSemaphoreGive(mutex);
 }
 
@@ -375,7 +381,6 @@ void eQ3::onNotify(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t
             case 0x05: {
                 // status changed notification
                 Serial.println("# Status changed notification");
-                // TODO request status
                 auto * message = new eQ3Message::StatusRequestMessage;
                 sendMessage(message);
                 break;
@@ -394,7 +399,8 @@ void eQ3::onNotify(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t
                 message.data = msgdata;
                 _LockStatus = message.getLockStatus();
                 _BatteryStatus = message.getBatteryStatus();
-                onStatusChange((LockStatus) _LockStatus); // BUG: löst einen Reset aus!!
+                _RSSI = bleClient->getRssi();
+                onStatusChange(_LockStatus, _BatteryStatus, _RSSI); // BUG: löst einen Reset aus!!
                 break;
             }
 

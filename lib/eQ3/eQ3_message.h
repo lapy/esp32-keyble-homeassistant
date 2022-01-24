@@ -50,9 +50,9 @@ public:
     class Status_Info_Message : public Message {
     public:
         Status_Info_Message();
-        int getLockStatus();
+        LockStatus getLockStatus();
         int getUserRightType();
-        bool getBatteryStatus();
+        BatteryStatus getBatteryStatus();
     };
 
     class StatusRequestMessage : public Message {

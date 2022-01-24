@@ -84,8 +84,6 @@ modules.xml
 *.ipr
 
 ### PlatformIO ###
-.pio
-.pio/*
 .pioenvs
 .piolibdeps
 .clang_complete
@@ -95,7 +93,6 @@ CMakeLists.txt
 cmake-build-debug
 
 ### VisualStudioCode ###
-.vscode
 .vscode/*
 !.vscode/settings.json
 !.vscode/tasks.json

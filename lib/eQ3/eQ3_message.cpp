@@ -140,8 +140,8 @@ eQ3Message::Status_Info_Message::Status_Info_Message() {
 // -----------------------------------------------------------------------------
 // --[getLockStatus]------------------------------------------------------------
 // -----------------------------------------------------------------------------
-int eQ3Message::Status_Info_Message::getLockStatus() {
-    return data[2] & 0x07;
+LockStatus eQ3Message::Status_Info_Message::getLockStatus() {
+    return (LockStatus)(data[2] & 0x07);
 }
 
 // -----------------------------------------------------------------------------
@@ -154,8 +154,8 @@ int eQ3Message::Status_Info_Message::getUserRightType() {
 // -----------------------------------------------------------------------------
 // --[getBatteryStatus]---------------------------------------------------------
 // -----------------------------------------------------------------------------
-bool eQ3Message::Status_Info_Message::getBatteryStatus() {
-    return (data[1] == 0x81);
+BatteryStatus eQ3Message::Status_Info_Message::getBatteryStatus() {
+    return (BatteryStatus)(data[1] == 0x81);
 }
 
 // -----------------------------------------------------------------------------
