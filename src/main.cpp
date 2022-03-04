@@ -131,6 +131,7 @@ void SetupHomeAssistant()
                              +"\"uniq_id\":\"keyble_" + ADDRESS + "_linkquality\"," +
                              +"\"stat_t\":\"~" + MQTT_PUB_RSSI + "\"," +
                              +"\"avty_t\":\"~" + MQTT_PUB_AVAILABILITY + "\"," +
+                             +"\"unit_of_meas\":\"rssi\"," +
                              +"\"dev_cla\":\"signal_strength\"}";
 
   Serial.println("# " + String(HOMEASSISTANT_MQTT_PREFIX) + "/sensor/KeyBLE/linkquality/config");
@@ -262,7 +263,7 @@ void StatusUpdateCallback(LockStatus newlockstatus, BatteryStatus newbatterystat
   str_availability.toCharArray(charBufferAvailability, 8);
 
   //MQTT_PUB_BATT battery
-  String str_batt = newbatterystatus ? "true" : "false";
+  String str_batt = newbatterystatus ? "ON" : "OFF";
   str_batt.toCharArray(charBufferBatt, 6);
 
   //MQTT_PUB_RSSI rssi

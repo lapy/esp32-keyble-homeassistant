@@ -108,6 +108,7 @@ void eQ3::onDisconnect(NimBLEClient *pClient) {
 bool eQ3::onConnParamsUpdateRequest(NimBLEClient* pClient, const ble_gap_upd_params* params) {
     Serial.println("# onConnParamsUpdateRequest!!!");
     pClient->setConnectionParams(params->itvl_min, params->itvl_max, params->latency, params->supervision_timeout);
+    return true;
 }
 
 // -----------------------------------------------------------------------------

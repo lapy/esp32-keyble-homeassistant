@@ -5,6 +5,17 @@
 
 using namespace std;
 
+/**
+ * Checks if a certain bit in a value is set.
+ * @param {number} value - The value.
+ * @param {number} bit_index - The zero-based index of the bit to check. 0 means the least-significant bit.
+ * @returns {boolean} True if the bit is set, false otherwise.
+ */
+bool is_bit_set(char value, int bit_index)
+{
+  return ((value & (1 << bit_index)) != 0);
+}
+
 // -----------------------------------------------------------------------------
 // --[getStatusByte]------------------------------------------------------------
 // -----------------------------------------------------------------------------
@@ -148,14 +159,14 @@ LockStatus eQ3Message::Status_Info_Message::getLockStatus() {
 // --[getUserRightType]---------------------------------------------------------
 // -----------------------------------------------------------------------------
 int eQ3Message::Status_Info_Message::getUserRightType() {
-    return (data[1] & 0x30) >> 4;
+    return (data[0] & 0x30) >> 4;
 }
 
 // -----------------------------------------------------------------------------
 // --[getBatteryStatus]---------------------------------------------------------
 // -----------------------------------------------------------------------------
 BatteryStatus eQ3Message::Status_Info_Message::getBatteryStatus() {
-    return (BatteryStatus)(data[1] == 0x81);
+    return (BatteryStatus)(is_bit_set(data[1], 7));
 }
 
 // -----------------------------------------------------------------------------
@@ -240,14 +251,14 @@ eQ3Message::AnswerWithSecurityMessage::AnswerWithSecurityMessage() {
 // --[getA]---------------------------------------------------------------------
 // -----------------------------------------------------------------------------
 bool eQ3Message::AnswerWithSecurityMessage::getA() {
-    return (data[1] & 0x80) == 0;
+    return is_bit_set(data[0], 6);
 }
 
 // -----------------------------------------------------------------------------
 // --[getB]---------------------------------------------------------------------
 // -----------------------------------------------------------------------------
 bool eQ3Message::AnswerWithSecurityMessage::getB() {
-    return (data[1] & 0x81) == 0;
+    return is_bit_set(data[0], 7);
 }
 
 // -----------------------------------------------------------------------------
